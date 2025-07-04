@@ -1,0 +1,38 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  font-family: Open Sans;
+}
+
+*:focus {
+  outline: none !important;
+}
+
+a {
+  color: @brand;
+  text-decoration: none;
+}
+
+html,
+body {
+  font-size: 14px;
+  background-color: #ffffff !important;
+}
+
+
+#khaleesi {
+  text-align: left;
+}
+
+
+
+html,
+body,
+#app { /* #app 是Vue通常的根元素ID */
+  width:100vw !important;
+  height: 100% !important;
+  margin: 0;
+  padding: 0;
+  overflow: hidden; /* 防止出现意外的滚动条 */
+}

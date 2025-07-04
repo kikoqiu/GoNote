@@ -2,12 +2,14 @@
 package main
 
 import (
+	"archive/zip"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -17,6 +19,7 @@ import (
 	"io/fs"
 	"log"
 	"math/big"
+	rnd "math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -29,21 +32,40 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
+	"github.com/robfig/cron/v3" // 新增的依赖
 	"github.com/sergi/go-diff/diffmatchpatch"
 	"go.etcd.io/bbolt"
 )
 
+//go:embed all:embed
+var embeddedFS embed.FS
+
+//go:embed Help.md
+var helpMarkdown []byte
+
+//go:embed Help.en.md
+var helpMarkdownEn []byte
+
 // --- config.go ---
 
+// 新增: 用于备份配置的结构体
+type BackupConfig struct {
+	Enabled       bool   `json:"enabled"`
+	Dir           string `json:"dir"`
+	Cron          string `json:"cron"`
+	RetentionDays int    `json:"retention_days"`
+}
+
 type Config struct {
-	Bind        string `json:"bind"`
-	TLS         bool   `json:"tls"`
-	CertFile    string `json:"cert_file"`
-	KeyFile     string `json:"key_file"`
-	VisitLog    string `json:"visit_log"`
-	MarkdownDir string `json:"markdown_dir"`
-	WWWDir      string `json:"www_dir"`
-	UsersFile   string `json:"users_file"`
+	Bind        string       `json:"bind"`
+	TLS         bool         `json:"tls"`
+	CertFile    string       `json:"cert_file"`
+	KeyFile     string       `json:"key_file"`
+	VisitLog    string       `json:"visit_log"`
+	MarkdownDir string       `json:"markdown_dir"`
+	WWWDir      string       `json:"www_dir"`
+	UsersFile   string       `json:"users_file"`
+	Backup      BackupConfig `json:"backup"` // 新增
 }
 
 var defaultConfig = Config{
@@ -55,6 +77,13 @@ var defaultConfig = Config{
 	MarkdownDir: "markdown",
 	WWWDir:      "www",
 	UsersFile:   "users.txt",
+	// 新增: 备份的默认配置
+	Backup: BackupConfig{
+		Enabled:       false,
+		Dir:           "backup",
+		Cron:          "0 0 1 * *", // 每月1日午夜
+		RetentionDays: 180,
+	},
 }
 
 var AppConfig Config
@@ -65,13 +94,18 @@ func LoadConfig() {
 	if _, err := os.Stat(configFile); err == nil {
 		file, err := os.ReadFile(configFile)
 		if err == nil {
-			json.Unmarshal(file, &AppConfig)
+			// 先解码到临时变量，以防某些字段缺失
+			tempConfig := defaultConfig
+			if err := json.Unmarshal(file, &tempConfig); err == nil {
+				AppConfig = tempConfig
+			}
 		}
-	} else {
-		data, err := json.MarshalIndent(AppConfig, "", "  ")
-		if err == nil {
-			os.WriteFile(configFile, data, 0644)
-		}
+	}
+
+	// 无论如何，都重新序列化并写入，以确保新字段（如backup）存在于文件中
+	data, err := json.MarshalIndent(AppConfig, "", "  ")
+	if err == nil {
+		os.WriteFile(configFile, data, 0644)
 	}
 
 	flag.StringVar(&AppConfig.Bind, "bind", AppConfig.Bind, "Address and port to bind the server")
@@ -95,9 +129,47 @@ func LoadUsers() {
 	defer userMutex.Unlock()
 
 	userCredentials = make(map[string]string)
+
 	if _, err := os.Stat(AppConfig.UsersFile); os.IsNotExist(err) {
-		log.Printf("Users file '%s' not found, creating a default user 'admin' with password 'admin'", AppConfig.UsersFile)
-		os.WriteFile(AppConfig.UsersFile, []byte("admin admin\n"), 0644)
+		defaultUser := "user"
+		passwordNum := 100000 + rnd.Intn(900000)
+		defaultPassword := fmt.Sprintf("%d", passwordNum)
+
+		log.Printf("========================= IMPORTANT =========================")
+		log.Printf("Users file '%s' not found.", AppConfig.UsersFile)
+		log.Printf("Creating a default user with the following credentials:")
+		log.Printf("  Username: %s", defaultUser)
+		log.Printf("  Password: %s", defaultPassword)
+		log.Printf("=============================================================")
+
+		fileContent := fmt.Sprintf("%s %s\n", defaultUser, defaultPassword)
+		if err := os.WriteFile(AppConfig.UsersFile, []byte(fileContent), 0644); err != nil {
+			log.Fatalf("FATAL: Failed to create default users file: %v", err)
+		}
+
+		userMarkdownPath := filepath.Join(AppConfig.MarkdownDir, defaultUser)
+		log.Printf("Creating markdown directory for new user at: %s", userMarkdownPath)
+		if err := os.MkdirAll(userMarkdownPath, 0755); err != nil {
+			log.Printf("WARNING: Failed to create markdown directory for user '%s': %v", defaultUser, err)
+		}
+
+		docDirPath := filepath.Join(userMarkdownPath, "Doc")
+		log.Printf("Creating 'Doc' directory for user at: %s", docDirPath)
+		if err := os.MkdirAll(docDirPath, 0755); err != nil {
+			log.Printf("WARNING: Failed to create 'Doc' directory for user '%s': %v", defaultUser, err)
+		}
+
+		userHelpPath := filepath.Join(docDirPath, "Help.md")
+		log.Printf("Creating user guide at: %s", userHelpPath)
+		if err := os.WriteFile(userHelpPath, helpMarkdown, 0644); err != nil {
+			log.Printf("WARNING: Failed to create user guide in 'Doc' directory: %v", err)
+		}
+
+		userHelpEnPath := filepath.Join(docDirPath, "Help.en.md")
+		log.Printf("Creating user guide at: %s", userHelpPath)
+		if err := os.WriteFile(userHelpEnPath, helpMarkdownEn, 0644); err != nil {
+			log.Printf("WARNING: Failed to create user guide in 'Doc' directory: %v", err)
+		}
 	}
 
 	file, err := os.ReadFile(AppConfig.UsersFile)
@@ -132,28 +204,172 @@ func AuthMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
-
+		sendUnauthorized := func(message string) {
+			if r.Header.Get("Api-Version") != "" {
+				respondError(w, http.StatusUnauthorized, message)
+			} else {
+				w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			}
+		}
 		user, pass, ok := r.BasicAuth()
 		if !ok {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			sendUnauthorized("Authentication credentials required")
 			return
 		}
-
 		userMutex.RLock()
 		expectedPass, userExists := userCredentials[user]
 		userMutex.RUnlock()
-
 		if !userExists || expectedPass != pass {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			sendUnauthorized("Invalid username or password")
 			return
 		}
-
 		ctx := context.WithValue(r.Context(), userContextKey, user)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
+
+// --- backup.go ---
+
+func StartBackupScheduler() {
+	if !AppConfig.Backup.Enabled {
+		log.Println("Automatic backup is disabled.")
+		return
+	}
+
+	log.Printf("Starting backup scheduler. Cron: '%s', Retention: %d days.", AppConfig.Backup.Cron, AppConfig.Backup.RetentionDays)
+
+	c := cron.New()
+
+	// Add the main backup job
+	_, err := c.AddFunc(AppConfig.Backup.Cron, performBackup)
+	if err != nil {
+		log.Fatalf("FATAL: Invalid backup cron expression: %v", err)
+	}
+
+	// Add a daily cleanup job (runs at 1 AM every day)
+	_, err = c.AddFunc("0 1 * * *", performBackupCleanup)
+	if err != nil {
+		log.Fatalf("FATAL: Could not schedule backup cleanup job: %v", err)
+	}
+
+	go c.Start()
+}
+
+func performBackup() {
+	log.Println("Starting scheduled backup...")
+
+	backupDir := AppConfig.Backup.Dir
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		log.Printf("ERROR: Could not create backup directory '%s': %v", backupDir, err)
+		return
+	}
+
+	timestamp := time.Now().Format("2006-01-02T15-04-05")
+	zipFileName := fmt.Sprintf("markdown-%s.zip", timestamp)
+	zipFilePath := filepath.Join(backupDir, zipFileName)
+
+	zipFile, err := os.Create(zipFilePath)
+	if err != nil {
+		log.Printf("ERROR: Could not create zip file '%s': %v", zipFilePath, err)
+		return
+	}
+	defer zipFile.Close()
+
+	zipWriter := zip.NewWriter(zipFile)
+	defer zipWriter.Close()
+
+	sourceDir := AppConfig.MarkdownDir
+
+	err = filepath.Walk(sourceDir, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil // Skip directories themselves
+		}
+
+		relPath, err := filepath.Rel(sourceDir, path)
+		if err != nil {
+			return err
+		}
+
+		// Use forward slashes for zip compatibility
+		zipPath := filepath.ToSlash(relPath)
+		writer, err := zipWriter.Create(zipPath)
+		if err != nil {
+			return err
+		}
+
+		fileToZip, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer fileToZip.Close()
+
+		_, err = io.Copy(writer, fileToZip)
+		return err
+	})
+
+	if err != nil {
+		log.Printf("ERROR: Failed during backup zipping process: %v", err)
+		// Attempt to clean up partially created zip file
+		os.Remove(zipFilePath)
+		return
+	}
+
+	log.Printf("Successfully created backup: %s", zipFilePath)
+}
+
+func performBackupCleanup() {
+	log.Println("Starting backup cleanup task...")
+
+	backupDir := AppConfig.Backup.Dir
+	retentionDays := AppConfig.Backup.RetentionDays
+	if retentionDays <= 0 {
+		log.Println("Backup retention is disabled (retention_days <= 0).")
+		return
+	}
+
+	cutoffTime := time.Now().Add(-time.Duration(retentionDays) * 24 * time.Hour)
+	log.Printf("Deleting backups older than %s", cutoffTime.Format("2006-01-02"))
+
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		log.Printf("ERROR: Could not read backup directory '%s' for cleanup: %v", backupDir, err)
+		return
+	}
+
+	deletedCount := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".zip") || !strings.HasPrefix(entry.Name(), "markdown-") {
+			continue
+		}
+
+		// Extract timestamp from filename: markdown-YYYY-MM-DDTHH-MM-SS.zip
+		timestampStr := strings.TrimSuffix(strings.TrimPrefix(entry.Name(), "markdown-"), ".zip")
+		backupTime, err := time.Parse("2006-01-02T15-04-05", timestampStr)
+		if err != nil {
+			log.Printf("WARNING: Could not parse timestamp from backup file '%s', skipping.", entry.Name())
+			continue
+		}
+
+		if backupTime.Before(cutoffTime) {
+			filePath := filepath.Join(backupDir, entry.Name())
+			log.Printf("Deleting old backup: %s", filePath)
+			if err := os.Remove(filePath); err != nil {
+				log.Printf("ERROR: Failed to delete old backup '%s': %v", filePath, err)
+			} else {
+				deletedCount++
+			}
+		}
+	}
+	log.Printf("Backup cleanup task finished. Deleted %d old backup(s).", deletedCount)
+}
+
+// --- store.go ---
+// ... (rest of the file is unchanged, so I will omit it for brevity and just show the main function)
+// ... all store.go, file_monitor.go, versioning.go, search.go, handlers.go, utils.go code remains the same ...
 
 // --- store.go ---
 
@@ -513,7 +729,7 @@ func SearchInMemory(query string, useRegex bool, user string) []SearchResult {
 		if matched {
 			context := getMatchContext(doc.Content, useRegex, re, keywords)
 			results = append(results, SearchResult{
-				Path:    doc.Path,
+				Path:    strings.ReplaceAll(strings.TrimPrefix(doc.Path, userPrefix), string(filepath.Separator), "/"),
 				Context: context,
 			})
 		}
@@ -553,12 +769,13 @@ func getMatchContext(content string, useRegex bool, re *regexp.Regexp, keywords 
 
 // --- handlers.go ---
 
-type ListItem struct {
-	Name        string    `json:"name"`
-	IsDir       bool      `json:"is_dir"`
-	Size        int64     `json:"size"`
-	ModTime     time.Time `json:"mod_time"`
-	AttachCount int       `json:"attach_count,omitempty"`
+type TreeItem struct {
+	Name        string      `json:"name"`
+	IsDir       bool        `json:"is_dir"`
+	Size        int64       `json:"size"`
+	ModTime     time.Time   `json:"mod_time"`
+	AttachCount int         `json:"attach_count,omitempty"`
+	Children    []*TreeItem `json:"children,omitempty"`
 }
 
 type AttachmentInfo struct {
@@ -602,7 +819,6 @@ func getUserPath(r *http.Request, subPath string) (basePath, fullPath, relPath s
 	return
 }
 
-// MODIFIED: Securely resolves an attachment path relative to a markdown file.
 func getSafeAttachmentPath(r *http.Request, mdPath, attachPath string) (string, error) {
 	userBasePath, _, _, err := getUserPath(r, "")
 	if err != nil {
@@ -855,6 +1071,7 @@ func handleFileOp(w http.ResponseWriter, r *http.Request) {
 
 func handleList(w http.ResponseWriter, r *http.Request) {
 	pathParam := r.URL.Query().Get("path")
+	recursive := r.URL.Query().Get("recursive") == "true"
 
 	_, fullPath, _, err := getUserPath(r, pathParam)
 	if err != nil {
@@ -862,13 +1079,64 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entries, err := os.ReadDir(fullPath)
-	if err != nil {
-		respondError(w, http.StatusInternalServerError, "Failed to read directory: "+err.Error())
+	var items []*TreeItem
+	var listErr error
+
+	if recursive {
+		items, listErr = buildTree(fullPath)
+	} else {
+		entries, err := os.ReadDir(fullPath)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "Failed to read directory: "+err.Error())
+			return
+		}
+
+		items = make([]*TreeItem, 0, len(entries))
+		for _, entry := range entries {
+			name := entry.Name()
+			if name == ".extra" || strings.HasSuffix(name, ".attach") {
+				continue
+			}
+
+			info, err := entry.Info()
+			if err != nil {
+				log.Printf("Could not get file info for %s: %v", name, err)
+				continue
+			}
+
+			item := &TreeItem{
+				Name:    name,
+				IsDir:   info.IsDir(),
+				Size:    info.Size(),
+				ModTime: info.ModTime(),
+			}
+
+			if !info.IsDir() && strings.HasSuffix(strings.ToLower(name), ".md") {
+				attachDir := filepath.Join(fullPath, name+".attach")
+				if attachEntries, err := os.ReadDir(attachDir); err == nil {
+					item.AttachCount = len(attachEntries)
+				}
+			}
+			items = append(items, item)
+		}
+	}
+
+	if listErr != nil {
+		respondError(w, http.StatusInternalServerError, "Failed to list directory contents: "+listErr.Error())
 		return
 	}
 
-	var items []ListItem = make([]ListItem, 0)
+	respondJSON(w, http.StatusOK, items)
+}
+
+func buildTree(dirPath string) ([]*TreeItem, error) {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read directory %s: %w", dirPath, err)
+	}
+
+	items := make([]*TreeItem, 0)
+
 	for _, entry := range entries {
 		name := entry.Name()
 		if name == ".extra" || strings.HasSuffix(name, ".attach") {
@@ -877,30 +1145,36 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 
 		info, err := entry.Info()
 		if err != nil {
+			log.Printf("Could not get file info for %s in %s: %v", name, dirPath, err)
 			continue
 		}
 
-		item := ListItem{
+		item := &TreeItem{
 			Name:    name,
 			IsDir:   info.IsDir(),
 			Size:    info.Size(),
 			ModTime: info.ModTime(),
 		}
 
-		if !info.IsDir() && strings.HasSuffix(strings.ToLower(name), ".md") {
-			attachDir := filepath.Join(fullPath, name+".attach")
-			if attachEntries, err := os.ReadDir(attachDir); err == nil {
-				item.AttachCount = len(attachEntries)
+		if info.IsDir() {
+			children, err := buildTree(filepath.Join(dirPath, name))
+			if err != nil {
+				log.Printf("Error building subtree for %s: %v", name, err)
+			}
+			item.Children = children
+		} else {
+			if strings.HasSuffix(strings.ToLower(name), ".md") {
+				attachDir := filepath.Join(dirPath, name+".attach")
+				if attachEntries, err := os.ReadDir(attachDir); err == nil {
+					item.AttachCount = len(attachEntries)
+				}
 			}
 		}
-
 		items = append(items, item)
 	}
 
-	respondJSON(w, http.StatusOK, items)
+	return items, nil
 }
-
-// --- Attachment Handlers ---
 
 func handleAttachUpload(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
@@ -1009,23 +1283,19 @@ func handleAttachList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// MODIFIED: This handler is now a universal file getter for a user's directory.
 func handleAttachGet(w http.ResponseWriter, r *http.Request) {
-	// The path is the full relative path from the user's root dir.
 	requestedPath := chi.URLParam(r, "*")
 	if requestedPath == "" {
 		respondError(w, http.StatusBadRequest, "File path is required.")
 		return
 	}
 
-	// getUserPath provides the core security check against directory traversal.
 	_, safeAbsPath, _, err := getUserPath(r, requestedPath)
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	// Additional check to prevent serving directories.
 	info, err := os.Stat(safeAbsPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1059,13 +1329,11 @@ func handleAttachDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Security: Deletion is only allowed for files inside a local ".md.attach" directory.
 	if !strings.Contains(filepath.ToSlash(req.AttachPath), ".md.attach/") {
 		respondError(w, http.StatusBadRequest, "Deletion is only allowed for local attachments inside a '.attach' directory.")
 		return
 	}
 
-	// We still use getSafeAttachmentPath to resolve and validate the path before deleting.
 	safeAbsPath, err := getSafeAttachmentPath(r, req.MdPath, req.AttachPath)
 	if err != nil {
 		if strings.Contains(err.Error(), "access denied") {
@@ -1218,24 +1486,36 @@ func generateSelfSignedCert() error {
 	return nil
 }
 
-const placeholderIndexHTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Markdown Editor</title>
-    <style>body { font-family: sans-serif; background-color: #f0f0f0; color: #333; margin: 2em; }</style>
-</head>
-<body>
-    <h1>Markdown Web Service</h1>
-    <p>Your awesome frontend application goes here!</p>
-    <p>This is a placeholder <code>index.html</code> served from the <code>www</code> directory.</p>
-	<p>The API is available under <code>/api/</code></p>
-</body>
-</html>
-`
-
 // --- main.go (entry point) ---
+
+func unpackEmbeddedFS(destDir string) error {
+	root := "embed"
+	return fs.WalkDir(embeddedFS, root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if relPath == "." {
+			return nil
+		}
+		destPath := filepath.Join(destDir, relPath)
+
+		if d.IsDir() {
+			return os.MkdirAll(destPath, 0755)
+		}
+
+		log.Printf("Unpacking: %s", relPath)
+		fileData, err := embeddedFS.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(destPath, fileData, 0644)
+	})
+}
 
 func main() {
 	LoadConfig()
@@ -1252,9 +1532,35 @@ func main() {
 	os.MkdirAll(AppConfig.MarkdownDir, 0755)
 	os.MkdirAll(AppConfig.WWWDir, 0755)
 
+	{
+		exePath, err := os.Executable()
+		if err != nil {
+			log.Printf("WARNING: Could not determine executable path to write Help.md: %v", err)
+		} else {
+			programDir := filepath.Dir(exePath)
+			rootHelpPath := filepath.Join(programDir, "Help.md")
+
+			if _, err := os.Stat(rootHelpPath); os.IsNotExist(err) {
+				log.Printf("Creating general user guide at: %s", rootHelpPath)
+				if err := os.WriteFile(rootHelpPath, helpMarkdown, 0644); err != nil {
+					log.Printf("WARNING: Failed to create user guide in program directory: %v", err)
+				}
+			}
+
+			rootHelpEnPath := filepath.Join(programDir, "Help.en.md")
+			if _, err := os.Stat(rootHelpEnPath); os.IsNotExist(err) {
+				log.Printf("Creating general user guide at: %s", rootHelpPath)
+				if err := os.WriteFile(rootHelpEnPath, helpMarkdownEn, 0644); err != nil {
+					log.Printf("WARNING: Failed to create user guide in program directory: %v", err)
+				}
+			}
+		}
+	}
+
 	LoadUsers()
 	store.Scan()
 	WatchMarkdownDir()
+	StartBackupScheduler() // 新增: 启动备份调度器
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
@@ -1263,8 +1569,8 @@ func main() {
 	corsMiddleware := cors.New(cors.Options{
 		AllowedOrigins:   []string{"*"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
-		ExposedHeaders:   []string{"Link"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token", "Api-Version", "Accept-Encoding"},
+		ExposedHeaders:   []string{"Link", "Content-Encoding"},
 		AllowCredentials: true,
 		MaxAge:           300,
 	})
@@ -1272,6 +1578,7 @@ func main() {
 	r.Route("/api", func(r chi.Router) {
 		r.Use(corsMiddleware.Handler)
 		r.Use(AuthMiddleware)
+		r.Use(middleware.Compress(5, "application/json"))
 
 		r.Post("/dir", handleDirOp)
 		r.Get("/list", handleList)
@@ -1293,9 +1600,15 @@ func main() {
 	})
 
 	if _, err := os.Stat(filepath.Join(AppConfig.WWWDir, "index.html")); os.IsNotExist(err) {
-		log.Println("index.html not found, creating a placeholder.")
-		os.WriteFile(filepath.Join(AppConfig.WWWDir, "index.html"), []byte(placeholderIndexHTML), 0644)
+		log.Println("index.html not found in 'www' directory. Unpacking embedded assets...")
+		if err := unpackEmbeddedFS(AppConfig.WWWDir); err != nil {
+			log.Fatalf("Failed to unpack embedded assets: %v", err)
+		}
+		log.Println("Successfully unpacked assets to 'www' directory.")
+	} else {
+		log.Println("Found existing 'www/index.html'. Skipping asset unpacking.")
 	}
+
 	fs := http.FileServer(http.Dir(AppConfig.WWWDir))
 	r.Handle("/*", fs)
 
